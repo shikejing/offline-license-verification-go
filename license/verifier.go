@@ -71,36 +71,53 @@ func (v *Verifier) Verify(tok string, fp Fingerprint) error {
 		return &Error{Reason: ReasonMachineMismatch, Detail: "token is bound to a different machine"}
 	}
 
-	// 4. 时钟异常与 5. 有效期：与观测高水位的更新放在同一临界区，
-	// 保证并发下判定与状态推进是原子的。
+	// 4. 时钟认知与有效期判定放在同一临界区：
+	// 读高水位 -> 判定 -> 推进高水位，对并发是原子的。
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
 	now := v.now().UTC()
-	if err := v.checkClock(now); err != nil {
+	last := v.store.LastSeen()
+
+	// 4a. 已被历史上“受信任的时间”确认过的过期，不因时钟被回拨而复活。
+	// 该判定先于时钟异常检查，因此把时间调回有效窗口得到的稳定原因是
+	// expired，可与 clock_rollback 等时钟异常区分开。
+	grace := v.opts.ExpiryGracePeriod
+	if !last.IsZero() && last.After(p.ExpiresAt.Add(grace)) {
+		return &Error{Reason: ReasonExpired, Detail: fmt.Sprintf("expired at %s (confirmed by observed time %s)", p.ExpiresAt.Format(time.RFC3339), last.Format(time.RFC3339))}
+	}
+
+	// 4b. 时钟异常：绝不信任、绝不写入异常时间，本机时间认知不被带偏。
+	if err := checkClock(now, last, v.opts); err != nil {
 		return err
 	}
+
+	// 4c. 时间受信任：无论下面凭证自身的检查结果如何，高水位只前进不后退。
+	// 一次被拒绝的校验（未生效/过期等）同样推进认知，失败不丢失时间点。
+	if err := v.store.Observe(now); err != nil {
+		return err
+	}
+
+	// 5. 凭证自身的有效期检查，与时钟异常相互独立。
 	if now.Before(p.NotBefore) {
 		return &Error{Reason: ReasonNotYetValid, Detail: fmt.Sprintf("valid from %s", p.NotBefore.Format(time.RFC3339))}
 	}
-	if now.After(p.ExpiresAt.Add(v.opts.ExpiryGracePeriod)) {
+	if now.After(p.ExpiresAt.Add(grace)) {
 		return &Error{Reason: ReasonExpired, Detail: fmt.Sprintf("expired at %s", p.ExpiresAt.Format(time.RFC3339))}
 	}
-
-	// 校验通过后才推进高水位，失败不污染状态。
-	return v.store.Observe(now)
+	return nil
 }
 
 // checkClock 依据高水位与宽限期策略识别异常时间，而不是直接信任本地时间。
-func (v *Verifier) checkClock(now time.Time) error {
-	last := v.store.LastSeen()
+// 回拨/前跳超限时返回对应原因；异常时间由调用方保证不会写入高水位。
+func checkClock(now, last time.Time, opts Options) error {
 	if last.IsZero() {
 		return nil // 首次运行，无基线可比对
 	}
-	if now.Before(last.Add(-v.opts.RollbackTolerance)) {
+	if now.Before(last.Add(-opts.RollbackTolerance)) {
 		return &Error{Reason: ReasonClockRollback, Detail: fmt.Sprintf("local clock %s is behind last observed %s beyond tolerance", now.Format(time.RFC3339), last.Format(time.RFC3339))}
 	}
-	if v.opts.ForwardJumpTolerance > 0 && now.After(last.Add(v.opts.ForwardJumpTolerance)) {
+	if opts.ForwardJumpTolerance > 0 && now.After(last.Add(opts.ForwardJumpTolerance)) {
 		return &Error{Reason: ReasonClockJump, Detail: fmt.Sprintf("local clock %s jumped forward from last observed %s beyond tolerance", now.Format(time.RFC3339), last.Format(time.RFC3339))}
 	}
 	return nil
