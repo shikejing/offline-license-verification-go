@@ -25,8 +25,8 @@ type Verifier struct {
 	store *StateStore
 	now   func() time.Time
 
-	// mu 串行化“读高水位→判定→写高水位”的临界区，
-	// 保证并发校验结果确定且可追溯。
+	// mu 串行化“读高水位→判定→写状态”的临界区，
+	// 保证并发校验结果确定且可复现。
 	mu sync.Mutex
 }
 
@@ -43,8 +43,8 @@ func (v *Verifier) SetClock(now func() time.Time) { v.now = now }
 
 // Verify 校验凭证与当前机器指纹。
 // 失败时返回 *Error，其 Reason 可区分：
-// malformed_token / bad_signature / revoked / machine_mismatch /
-// clock_rollback / clock_jump / not_yet_valid / expired。
+// malformed_token / bad_signature / revoked / expired / machine_mismatch /
+// clock_rollback / clock_jump / not_yet_valid。
 // 检查顺序固定，因此相同输入的结果确定且可复现。
 func (v *Verifier) Verify(tok string, fp Fingerprint) error {
 	p, sig, err := Decode(tok)
@@ -66,32 +66,57 @@ func (v *Verifier) Verify(tok string, fp Fingerprint) error {
 		return &Error{Reason: ReasonRevoked, Detail: "license " + p.ID + " has been revoked"}
 	}
 
-	// 3. 机器绑定：常量时间比较，绑定信息被改写或换机都会失败。
-	if subtle.ConstantTimeCompare([]byte(p.MachineHash), []byte(fp.Hash())) != 1 {
-		return &Error{Reason: ReasonMachineMismatch, Detail: "token is bound to a different machine"}
+	// 3. 过期墓碑：只要此前在某个可信时间读数下确认过该凭证过期，
+	// 物理时间只进不退，它就永久过期。此判定先于时钟检查，
+	// 因而即便把本机时间回拨回有效窗口，拒绝原因也稳定为 expired，
+	// 而不会与 clock_rollback 等原因混淆。
+	if v.store.IsExpired(p.ID) {
+		return &Error{Reason: ReasonExpired, Detail: fmt.Sprintf("license %s expired at %s", p.ID, p.ExpiresAt.Format(time.RFC3339))}
 	}
 
-	// 4. 时钟异常与 5. 有效期：与观测高水位的更新放在同一临界区，
-	// 保证并发下判定与状态推进是原子的。
+	// 此后进入“依赖当前时间”的判定，整个阶段在同一临界区内完成，
+	// 保证并发下判定与状态推进原子、结果可复现。
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	// 4. 读取当前时间并识别时钟异常。读数一旦通过时钟检查即视为可信，
+	// 立刻推进并持久化高水位，再进行后续凭证判定。这样无论随后因机器
+	// 绑定不符、未生效还是过期而拒绝，这次“已确认的时间点”都不会丢失，
+	// 也不可能被改写为更早的值；而回拨/前跳等不可信读数在此即被挡下，
+	// 既不推进高水位，也不产生过期墓碑，本机时间认知不会被异常带偏。
 	now := v.now().UTC()
 	if err := v.checkClock(now); err != nil {
 		return err
 	}
+	if err := v.store.Observe(now); err != nil {
+		return &Error{Reason: ReasonMalformed, Detail: "persist clock observation: " + err.Error()}
+	}
+
+	// 5. 机器绑定：常量时间比较，绑定信息被改写或换机都会失败。
+	// 走到这里说明时间已被读取并推进，该凭证失败不会回退时间认知。
+	if subtle.ConstantTimeCompare([]byte(p.MachineHash), []byte(fp.Hash())) != 1 {
+		return &Error{Reason: ReasonMachineMismatch, Detail: "token is bound to a different machine"}
+	}
+
+	// 6. 有效期。
 	if now.Before(p.NotBefore) {
 		return &Error{Reason: ReasonNotYetValid, Detail: fmt.Sprintf("valid from %s", p.NotBefore.Format(time.RFC3339))}
 	}
 	if now.After(p.ExpiresAt.Add(v.opts.ExpiryGracePeriod)) {
+		// 在可信时间读数下确认过期：写入不可清除的持久化墓碑。
+		// 此后无论时钟如何回拨、经历多少次失败校验、重启多少次，
+		// 该凭证都稳定返回 expired。
+		if err := v.store.MarkExpired(p.ID); err != nil {
+			return &Error{Reason: ReasonMalformed, Detail: "persist expiry: " + err.Error()}
+		}
 		return &Error{Reason: ReasonExpired, Detail: fmt.Sprintf("expired at %s", p.ExpiresAt.Format(time.RFC3339))}
 	}
-
-	// 校验通过后才推进高水位，失败不污染状态。
-	return v.store.Observe(now)
+	return nil
 }
 
 // checkClock 依据高水位与宽限期策略识别异常时间，而不是直接信任本地时间。
+// 高水位只由“通过了时钟检查的读数”推进，因此异常读数（回拨/前跳）
+// 永远无法抬高或压低它：回拨读数不被接受，前跳读数不会把认知带向未来。
 func (v *Verifier) checkClock(now time.Time) error {
 	last := v.store.LastSeen()
 	if last.IsZero() {
